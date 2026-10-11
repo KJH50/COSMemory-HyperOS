@@ -63,6 +63,12 @@ while :; do
   rm -f "$WORKDIR/.listskip"
   [ "${LIST_BAD:-0}" -gt 0 ] && echo "LIST_BAD=$LIST_BAD detail=$LIST_BAD_DETAIL" >> "$STATS_LOG"
   detect_death "$WORKDIR/parsed.txt" "$WHITE_LIST"
+  # v1.2.2: keepAlive.adj 热读（支撑 URO 指挥链的档位联动；缺省回环境变量/200）
+  if [ -f "$MODDIR/config/memory.json" ]; then
+    _ka=$(sed -n '/"keepAlive"/,/}/p' "$MODDIR/config/memory.json" 2>/dev/null \
+          | grep -oE '"adj"[[:space:]]*:[[:space:]]*-?[0-9]+' | grep -oE '\-?[0-9]+' | head -1)
+    [ -n "$_ka" ] && KEEPADJ_TARGET="$_ka"
+  fi
   plan_keepalive "$WORKDIR/parsed.txt" "$WHITE_LIST" "$KEEPADJ_TARGET" > "$WORKDIR/acts"
   plan_reclaim   "$WORKDIR/parsed.txt" "$KILL_LIST" "$WORKDIR/cool" "$MAX_KILL" "$WHITE_LIST" >> "$WORKDIR/acts"
 # reclaim_cycle: 激进回收主循环段(可注入: MODDIR/PSI_PATH/MEMINFO_PATH/WORKDIR/CAP_PSI)

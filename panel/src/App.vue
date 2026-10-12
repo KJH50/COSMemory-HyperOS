@@ -4,7 +4,7 @@ import { detectBridge, execRead, execReadBatch, type KsuBridge } from './composa
 import { buildDiagCmd } from './composables/diagnostics'
 import { parseStats, parseCaps, whiteStatus, CAP_LABELS, type DayStats } from './composables/stats'
 import { parseGuard, guardDate, type GuardStats } from './composables/guard'
-import { initTheme, syncThemeFromModule } from './composables/theme'
+import { initTheme, applyModuleTheme } from './composables/theme'
 import { parseMemtop, parseFrozen, type MemRow } from './composables/memview'
 import DashboardView from './views/DashboardView.vue'
 import DefenseView from './views/DefenseView.vue'
@@ -14,6 +14,12 @@ import SettingsView from './views/SettingsView.vue'
 
 const MOD = '/data/adb/modules/COSMemory'
 const LIST = '/sdcard/Android/COSMemory/名单列表.conf'
+/* panel-perf: 内存观测改为"后台执行 + 轮询取回" —— dumpsys(~3s)不再阻塞 UI 线程 */
+const MEM_OUT = '/data/local/tmp/.cosmem_panel_mem.out'
+const MEM_BUSY = '/data/local/tmp/.cosmem_panel_mem.busy'
+/* panel-perf3: 防线数据后台刷新 —— guard_stats(~0.5s) 不再进同步批 */
+const GUARD_OUT = '/data/local/tmp/.cosmem_panel_guard.json'
+const GUARD_BUSY = '/data/local/tmp/.cosmem_panel_guard.busy'
 
 const bridge = ref<KsuBridge | null>(detectBridge())
 const stats = ref<DayStats | null>(null)
@@ -41,8 +47,27 @@ type Tab = 'dash' | 'defense' | 'system' | 'list' | 'set'
 const activeTab = ref<Tab>('dash')
 function goTab(id: Tab) { activeTab.value = id; document.querySelector('.wrap')?.scrollTo({ top: 0 }) }
 let timer: number | undefined
+
+/* ---- panel-perf 基础设施 ---- */
+let refreshing = false          // 防重入: 上一轮未回不再发起
+let memPending = false          // 内存后台任务在途
+let memPendingTs = 0
+let memStuck = false            // STUCK 提示只弹一次
+let memFallback = false         // 后台分离被管理器杀掉 → 本会话回退直读
+let tick = 0
+let guardFallback = false
+let guardStuckOff = false
+const lastJSON = new Map<string, string>()
+/** 值未变则跳过赋值 → 跳过整棵组件重渲染 (稳态 5s 轮询几乎零重绘) */
+function setIfChanged(key: string, value: unknown, set: (v: any) => void) {
+  const s = JSON.stringify(value)
+  if (lastJSON.get(key) === s) return
+  lastJSON.set(key, s)
+  set(value)
+}
+
 /* onPickDate: 模板里 guardDate 会被解包成字符串, .value 赋值在严格模式抛错导致选日期无效 */
-function onPickDate(d: string) { guardDate.value = d; void refresh() }
+function onPickDate(d: string) { guardDate.value = d; void startGuardRefresh(); void refresh() }
 /* exportDiag: 诊断包一次桥往返导出到 /sdcard/Download */
 async function exportDiag() {
   const b = bridge.value
@@ -70,62 +95,77 @@ const CAP_ICON: Record<string, string> = {
 async function refresh() {
   const b = bridge.value
   if (!b) { error.value = '未检测到 KSU 桥（请在 KernelSU 管理器中打开）'; return }
+  if (refreshing) return
+  refreshing = true
+  tick++
   try {
-    // 批量单往返: ksu.exec 同步阻塞, 原 Promise.all 6条实为串行 6 次 shell 启动;
-    // @@SEG@@ 分隔符合并为一次 base64 往返 (数据到位 6s -> ~1.5s)
+    // panel-perf: 单次同步往返内完成全部刷新; 白名单 adj 由 shell 聚合(不再二次 exec);
+    // 主题/内存卡状态并入同批; 结果按 setIfChanged 去抖, 稳态几乎零重绘。
     const seg = await execReadBatch(b, [
-      `printf '\\n@@SEG:log@@\\n'; tail -100 ${MOD}/data/stats.log 2>/dev/null`,
+      `printf '\\n@@SEG:log@@\\n'; tail -60 ${MOD}/data/stats.log 2>/dev/null`,
       `printf '\\n@@SEG:caps@@\\n'; cat ${MOD}/data/caps.conf 2>/dev/null`,
       `printf '\\n@@SEG:list@@\\n'; cat "${LIST}" 2>/dev/null`,
-      `printf '\\n@@SEG:parsed@@\\n'; cat ${MOD}/data/parsed.txt 2>/dev/null`,
       `printf '\\n@@SEG:pid@@\\n'; pgrep -f engine/memory.sh 2>/dev/null || true`,
-      `printf '\\n@@SEG:guard@@\\n'; sh ${MOD}/engine/guard_stats.sh ${guardDate.value || ''} 2>/dev/null || true`,
+      `printf '\\n@@SEG:guard@@\\n'; if [ '${guardFallback ? 1 : 0}' = "1" ]; then sh ${MOD}/engine/guard_stats.sh ${guardDate.value || ''} 2>/dev/null || true; else cat ${GUARD_OUT} 2>/dev/null; fi`,
+      `printf '\\n@@SEG:gst@@\\n'; if [ '${guardFallback ? 1 : 0}' = "1" ]; then echo OK; elif [ -f ${GUARD_BUSY} ]; then a=$(( $(date +%s) - $(stat -c %Y ${GUARD_BUSY} 2>/dev/null || echo 0) )); if [ "$a" -gt 20 ]; then mv -f ${GUARD_BUSY} ${GUARD_BUSY}.stale 2>/dev/null; echo STUCK; else echo RUNNING; fi; elif [ -f ${GUARD_OUT} ]; then echo OK; else echo EMPTY; fi`,
+      `printf '\\n@@SEG:theme@@\\n'; cat ${MOD}/data/theme 2>/dev/null`,
+      `printf '\\n@@SEG:mem@@\\n'; if [ -f ${MEM_BUSY} ]; then a=$(( $(date +%s) - $(stat -c %Y ${MEM_BUSY} 2>/dev/null || echo 0) )); if [ "$a" -gt 15 ]; then mv -f ${MEM_BUSY} ${MEM_BUSY}.stale 2>/dev/null; echo STUCK; else echo RUNNING; fi; elif [ -f ${MEM_OUT} ]; then cat ${MEM_OUT}; else echo NONE; fi`,
+      `printf '\\n@@SEG:white@@\\n'; awk -F'|' 'FNR==NR{n=split($0,a," ");if(a[1]=="WHITE"&&a[2]!=""){wl[a[2]]=1};next}{st=$1;pid=$3;pkg=$4;if(pkg==""||pid=="")next;hit=0;for(w in wl){if(pkg==w||(index(w,":")==0&&index(pkg,w":")==1)){hit=1;break}}if(hit)print st"|"pid"|"pkg"}' "${LIST}" ${MOD}/data/parsed.txt 2>/dev/null | while IFS='|' read -r st pid pkg; do a=$(cat /proc/$pid/oom_score_adj 2>/dev/null); [ -n "$a" ] && printf '%s|%s|%s\\n' "$st" "$a" "$pkg"; done`,
     ].join('; '))
     const log = seg.log ?? ''
     const capsTxt = seg.caps ?? ''
     const listTxt = seg.list ?? ''
-    const parsed = seg.parsed ?? ''
     const livePid = seg.pid ?? ''
     const guardTxt = seg.guard ?? ''
-    stats.value = parseStats(log)
-    guard.value = parseGuard(guardTxt)
-    caps.value = parseCaps(capsTxt)
+    const themeTxt = seg.theme ?? ''
+    const memTxt = (seg.mem ?? '').trim()
+
+    setIfChanged('stats', parseStats(log), v => { stats.value = v as DayStats })
+    const guardSt = (seg.gst ?? '').trim()
+    if (guardFallback) {
+      if (guardTxt) setIfChanged('guard', parseGuard(guardTxt), v => { guard.value = v as GuardStats | null })
+    } else if (guardSt === 'STUCK') {
+      if (!guardStuckOff) { guardStuckOff = true; guardFallback = true; toast('防线数据后台读取超时，已切回直读模式', false) }
+    } else if (guardSt === 'OK') {
+      if (guardTxt) setIfChanged('guard', parseGuard(guardTxt), v => { guard.value = v as GuardStats | null })
+    }
+    setIfChanged('caps', parseCaps(capsTxt), v => { caps.value = v as Record<string, number> })
+    setIfChanged('list', listTxt, v => { listRaw.value = v as string })
     const wl = listTxt.split('\n').filter(l => l.startsWith('WHITE ')).map(l => l.slice(6).trim()).join(' ')
-    listRaw.value = listTxt
-
-    // 解析引擎快照 → pid 信息表 (state|proc|pid|pkg)
-    const pidInfo = new Map<string, { state: string; pkg: string }>()
-    const stateMap = new Map<string, string>()
-    for (const l of parsed.split('\n')) {
-      const [st, , pid, pkg] = l.split('|')
-      if (!pkg || !pid) continue
-      stateMap.set(pkg, st)
-      pidInfo.set(pid, { state: st, pkg })
-    }
-
-    // 阶段2: 只读白名单命中的 pid 的实时 adj (5~10个, ~15ms)
-    const wlArr = wl.split(/\s+/).filter(Boolean)
-    const wantPids = [...pidInfo.entries()]
-      .filter(([, v]) => wlArr.some(w => v.pkg === w || (!w.includes(':') && v.pkg.startsWith(w + ':'))))
-      .map(([pid]) => pid)
-    let adjOut = ''
-    if (wantPids.length) {
-      adjOut = await execRead(b,
-        `for p in ${wantPids.join(' ')}; do echo "$p $(cat /proc/$p/oom_score_adj 2>/dev/null)"; done`)
-    }
-
-    // 拼成 whiteStatus 需要的 state|adj|pkg 行
-    const rows: string[] = []
-    for (const line of adjOut.split('\n')) {
-      const [pid, adj] = line.trim().split(/\s+/)
-      const info = pidInfo.get(pid)
-      if (info && adj) rows.push(`${info.state}|${adj}|${info.pkg}`)
-    }
-    white.value = whiteStatus(rows.join('\n'), wl)
-    logTail.value = log.split('\n').filter(Boolean).slice(-50).reverse()
+    setIfChanged('white', whiteStatus(seg.white ?? '', wl), v => { white.value = v as typeof white.value })
+    applyModuleTheme(themeTxt)
+    const lt = log.split('\n').filter(Boolean).slice(-50).reverse()
+    setIfChanged('logtail', lt, v => { logTail.value = v as string[] })
     engineUp.value = livePid.trim().length > 0
+    // 防线数据：后台刷新（每 ~10s 触发一次；busy 文件自去重）
+    if (!guardFallback && tick % 2 === 1) { void startGuardRefresh() }
+
+    // 内存卡状态机（后台任务 / 超时回退 / 结果回填）
+    if (memTxt === 'RUNNING') {
+      memLoading.value = true
+    } else if (memTxt === 'STUCK') {
+      memLoading.value = false
+      if (!memStuck) {
+        memStuck = true; memFallback = true
+        if (memPending) { memPending = false; toast('内存数据后台读取超时，已切回直读模式（再点一次刷新）', false) }
+      }
+    } else if (memTxt.startsWith('OK:')) {
+      const lines = memTxt.split('\n')
+      const rows = parseMemtop(lines[0] ?? '')
+      if (rows.length) setIfChanged('memtop', rows, v => { memtop.value = v as MemRow[] })
+      const fz = parseFrozen(lines[1] ?? '')
+      if (fz.count >= 0) setIfChanged('frozen', fz, v => { frozen.value = v as typeof frozen.value })
+      if (memPending) {
+        memPending = false
+        toast(`✓ 已刷新 · TOP${rows.length} · 墓碑 ${fz.count >= 0 ? fz.count : '—'} 个`)
+      }
+      memLoading.value = false
+    } else {
+      // NONE/空: 后台启动后暂无产物
+      if (memPending && Date.now() - memPendingTs > 12000) { memPending = false; memLoading.value = false }
+    }
     error.value = ''
-  } catch (e) { error.value = String(e) }
+  } catch (e) { error.value = String(e) } finally { refreshing = false }
 }
 
 const TABS: { id: Tab; label: string; icon: string }[] = [
@@ -139,26 +179,48 @@ const TABS: { id: Tab; label: string; icon: string }[] = [
 const capsOk = computed(() => Object.values(caps.value).filter(v => v === 1).length)
 const capsEntries = computed(() => Object.entries(caps.value))
 
-/** v1.1.0 内存/冻结观测: 按需加载(不进5s轮询, memtop约2.8s), 手动刷新可重跑 */
-async function loadMem() {
+/** 后台启动内存观测（dumpsys ~3s 不再阻塞 UI）; 结果由 refresh 轮询取回 */
+async function startMemRefresh() {
   const b = bridge.value
   if (!b) return
+  if (memFallback) { await syncMemRefresh(); return }
+  if (memPending) return
+  memPending = true
+  memPendingTs = Date.now()
   memLoading.value = true
   try {
-    // 2 条合 1 次往返 (memtop ~3s 是 dumpsys 计算, 合并省的是 shell 启动开销)
+    await execRead(b, `{ [ -f ${MEM_BUSY} ] && exit 0; touch ${MEM_BUSY}; if command -v setsid >/dev/null 2>&1; then setsid sh -c 'sh ${MOD}/engine/memtop.sh 2>/dev/null; sh ${MOD}/engine/frozencap.sh 2>/dev/null' > ${MEM_OUT}.tmp 2>&1; else sh -c 'sh ${MOD}/engine/memtop.sh 2>/dev/null; sh ${MOD}/engine/frozencap.sh 2>/dev/null' > ${MEM_OUT}.tmp 2>&1; fi; mv -f ${MEM_OUT}.tmp ${MEM_OUT}; mv -f ${MEM_BUSY} ${MEM_BUSY}.done; } >/dev/null 2>&1 & echo STARTED`)
+  } catch { /* 忽略：由 refresh 轮询兜底 */ }
+}
+
+/** 防线数据后台刷新（guard_stats ~0.5s，不再阻塞 UI）；结果由 refresh 轮询取回 */
+async function startGuardRefresh() {
+  const b = bridge.value
+  if (!b || guardFallback) return
+  try {
+    await execRead(b, `{ [ -f ${GUARD_BUSY} ] && exit 0; touch ${GUARD_BUSY}; if command -v setsid >/dev/null 2>&1; then setsid sh -c 'sh ${MOD}/engine/guard_stats.sh ${guardDate.value || ''} 2>/dev/null' > ${GUARD_OUT}.tmp 2>&1; else sh -c 'sh ${MOD}/engine/guard_stats.sh ${guardDate.value || ''} 2>/dev/null' > ${GUARD_OUT}.tmp 2>&1; fi; mv -f ${GUARD_OUT}.tmp ${GUARD_OUT}; mv -f ${GUARD_BUSY} ${GUARD_BUSY}.done; } >/dev/null 2>&1 & echo STARTED`)
+  } catch { /* 忽略：由 refresh 轮询兜底 */ }
+}
+
+/** 直读模式（同步阻塞 ~3s）：仅当后台分离失败/被管理器杀掉时使用 */
+async function syncMemRefresh() {
+  const b = bridge.value
+  if (!b || memLoading.value) return
+  memLoading.value = true
+  try {
     const mb = await execReadBatch(b,
       `printf '\\n@@SEG:m@@\\n'; sh ${MOD}/engine/memtop.sh 2>/dev/null; printf '\\n@@SEG:f@@\\n'; sh ${MOD}/engine/frozencap.sh 2>/dev/null`)
-    const m = mb.m ?? ''
-    const f = mb.f ?? ''
-    const rows = parseMemtop(m)
+    const rows = parseMemtop(mb.m ?? '')
     if (rows.length) memtop.value = rows
-    const fz = parseFrozen(f)
+    const fz = parseFrozen(mb.f ?? '')
     if (fz.count >= 0) frozen.value = fz
-    /* mem-refresh-toast: 刷新完成反馈 */
     if (rows.length) toast(`✓ 已刷新 · TOP${rows.length} · 墓碑 ${fz.count >= 0 ? frozen.value?.count : '—'} 个`)
     else toast('刷新完成，但未读到内存数据', false)
-  } catch (e) { toast('刷新失败: ' + String(e), false) } finally { memLoading.value = false }
+  } catch (e) { toast('刷新失败: ' + String(e).slice(0, 60), false) } finally { memLoading.value = false }
 }
+
+/** 刷新按钮/开屏入口：默认后台模式 */
+function loadMem() { if (memFallback) { void syncMemRefresh() } else { void startMemRefresh() } }
 
 /** v1.1.0 一键释放: touch force_reclaim 旗标, 回读验证, 引擎≤8s执行; 9s后再拉观测 */
 async function releaseNow() {
@@ -169,7 +231,7 @@ async function releaseNow() {
     const r = await execRead(b, `touch ${MOD}/data/force_reclaim && echo TRIG`)
     if (r.includes('TRIG')) {
       toast('✓ 已触发释放，引擎 ≤8 秒执行')
-      window.setTimeout(() => { void loadMem() }, 9000)
+      window.setTimeout(() => { loadMem() }, 9000)
     } else toast('触发失败: ' + (r.trim() || '空回读'), false)
   } catch (e) { toast(String(e), false) } finally { freeing.value = false }
 }
@@ -232,19 +294,25 @@ async function setUroBridge(v: boolean) {
   } catch (e) { error.value = String(e) }
 }
 
-/* boot-after-paint: ksu.exec 同步阻塞 JS 线程, 若在 onMounted 直接跑 8 条桥命令
+/* boot-after-paint: ksu.exec 同步阻塞 JS 线程, 若在 onMounted 直接跑多条桥命令
    (含 memtop ~3s), WebView 首帧会被推迟 5s+ (灰屏根因)。
-   rAF 内只做调度, setTimeout 让出主线程给渲染, 先画首帧再拉数据。 */
+   panel-perf: 首帧后先拉一次主数据; 内存观测延后 1.2s 且后台执行; 轮询在页面隐藏时暂停。 */
+function onVis() { if (!document.hidden) void refresh() }
 onMounted(() => {
   initTheme()
+  document.addEventListener('visibilitychange', onVis)
   requestAnimationFrame(() => setTimeout(() => {
-    void syncThemeFromModule()
-    refresh()
-    void loadMem()
-    timer = window.setInterval(refresh, 5000)
+    void refresh()
+    void startGuardRefresh()
+    window.setTimeout(() => { loadMem() }, 1200)
+    window.setTimeout(() => { void refresh() }, 1600)
+    timer = window.setInterval(() => { if (!document.hidden) void refresh() }, 5000)
   }, 0))
 })
-onUnmounted(() => { if (timer) clearInterval(timer) })
+onUnmounted(() => {
+  if (timer) clearInterval(timer)
+  document.removeEventListener('visibilitychange', onVis)
+})
 
 </script>
 

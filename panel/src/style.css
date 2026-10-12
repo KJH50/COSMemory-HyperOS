@@ -98,7 +98,7 @@ body{
 .tabbar{flex:0 0 auto;
   display:grid; grid-template-columns:repeat(5,1fr);
   background:var(--card); border-top:1px solid var(--sep);
-  padding:7px 0 calc(7px + env(safe-area-inset-bottom, 0px)); backdrop-filter:blur(12px)}
+  padding:7px 0 calc(7px + env(safe-area-inset-bottom, 0px)); -webkit-backdrop-filter:blur(12px); backdrop-filter:blur(12px)}
 .tabbar button{display:flex; flex-direction:column; align-items:center; gap:3px;
   border:none; background:transparent; cursor:pointer; color:var(--ink3); font-size:10.5px}
 .tabbar button .si{width:22px; height:22px; fill:var(--ink3); transition:fill .15s}
@@ -127,3 +127,7 @@ body{
 @keyframes toastin{from{opacity:0; transform:translateX(-50%) translateY(10px)}to{opacity:1}}
 @media (prefers-color-scheme:dark){.toast{background:#EFE7E2; color:#171310}
   .toast.ok{background:#7FBE93; color:#171310}}
+
+/* panel-perf: 长列表离屏跳过渲染, 降低滚动/重绘成本; 底部导航去 backdrop-filter(WebView 合成开销大) */
+.logline,.gd-ev,.lc-line{content-visibility:auto; contain-intrinsic-size:auto 26px}
+.wrap{overscroll-behavior:contain}

@@ -28,14 +28,19 @@ async function load() {
   } catch { state.value = 'fallback' }
 }
 watch(() => props.open, (v) => { if (v) { q.value = ''; load() } })
-watch(q, async () => {
+/* panel-perf: 搜索去抖 220ms —— 避免每敲一个字符就发起一次桥执行取图标 */
+let qTimer: number | undefined
+watch(q, () => {
   if (state.value !== 'ok') return
-  const b = detectBridge(); if (!b) return
-  const pkgs = shown.value.map(a => a.p).filter(p => !icons.value[p])
-  if (pkgs.length) {
-    const out = await execRead(b, iconCmd(pkgs.slice(0, 30))).catch(() => '')
-    Object.assign(icons.value, parseIcons(out))
-  }
+  if (qTimer) clearTimeout(qTimer)
+  qTimer = window.setTimeout(async () => {
+    const b = detectBridge(); if (!b) return
+    const pkgs = shown.value.map(a => a.p).filter(p => !icons.value[p])
+    if (pkgs.length) {
+      const out = await execRead(b, iconCmd(pkgs.slice(0, 30))).catch(() => '')
+      Object.assign(icons.value, parseIcons(out))
+    }
+  }, 220)
 })
 function pick(p: string) { emit('select', p); emit('close') }
 </script>

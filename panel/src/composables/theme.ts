@@ -48,18 +48,23 @@ export function persistThemeToModule(m: ThemeMode): void {
   } catch { /* ignore */ }
 }
 
+/** 模块侧主题值 → 应用（panel-perf: 供面板批量刷新合并调用，免去单独一次桥执行） */
+export function applyModuleTheme(v: string): void {
+  const t = (v || '').trim()
+  if (t === 'light' || t === 'dark' || t === 'system') {
+    if (t !== themeMode.value) { themeMode.value = t; applyTheme() }
+  } else {
+    if (themeMode.value !== 'system') { themeMode.value = 'system'; applyTheme() }
+    try { localStorage.removeItem(KEY) } catch { /* ignore */ }
+  }
+}
+
 // 启动对账 (App onMounted): 模块侧为准; 侧文件缺失 = 全新安装/卸载重装 → 清残留回出厂 system
 export async function syncThemeFromModule(): Promise<void> {
   let b: ReturnType<typeof detectBridge> = null
   try { b = detectBridge() } catch { /* ignore */ }
   if (!b) return
-  const v = (await execRead(b, `cat ${MOD_THEME} 2>/dev/null`)).trim()
-  if (v === 'light' || v === 'dark' || v === 'system') {
-    if (v !== themeMode.value) { themeMode.value = v; applyTheme() }
-  } else {
-    if (themeMode.value !== 'system') { themeMode.value = 'system'; applyTheme() }
-    try { localStorage.removeItem(KEY) } catch { /* ignore */ }
-  }
+  applyModuleTheme(await execRead(b, `cat ${MOD_THEME} 2>/dev/null`))
 }
 
 /** App onMounted 调用: 应用当前主题 + 监听系统切换(仅 system 模式跟随) */

@@ -1,3 +1,10 @@
+> ⚠️ **本仓库是 COSMemory 的「系统兼容适配」fork**（维护：KJH50）
+>
+> - 上游：[wzcawzc123/COSMemory](https://github.com/wzcawzc123/COSMemory)（其本身为 HChai/OneB1ank 的 A1Memory 二次开发，GPLv3）
+> - 目标：让 COSMemory 在 **小米 HyperOS**（后续扩展更多系统）上「装得上、跑得稳、可回滚」
+> - 当前策略：**引擎零改动**；适配集中在 配置 / 安装 / 验证 / 文档 四层
+> - 入口：`docs/compat/`（适配总览）· `docs/compat/hyperos/`（HyperOS）· `tools/hyperos-healthcheck.sh`（一键体检）
+
 <div align="center">
 <h1>COSMemory 内存管理</h1>
 
